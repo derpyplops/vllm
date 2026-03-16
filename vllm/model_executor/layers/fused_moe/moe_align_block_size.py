@@ -4,6 +4,7 @@
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
 
@@ -97,10 +98,67 @@ def moe_align_block_size(
         expert_map if ignore_invalid_experts else None,
     )
 
+    # Batch invariant mode: the CUDA kernel uses atomicAdd to assign
+    # positions within expert buckets, which produces non-deterministic
+    # ordering across runs.  Re-sort token indices within each expert
+    # bucket (ascending by token id) to eliminate this source of
+    # non-determinism.
+    if vllm_is_batch_invariant():
+        sorted_ids = _deterministic_sort_within_experts(
+            sorted_ids, expert_ids, block_size, num_tokens_post_pad, topk_ids.numel()
+        )
+
     if expert_map is not None and not ignore_invalid_experts:
         expert_ids = expert_map[expert_ids]
 
     return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+def _deterministic_sort_within_experts(
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    block_size: int,
+    num_tokens_post_pad: torch.Tensor,
+    num_valid_tokens: int,
+) -> torch.Tensor:
+    """Sort token indices across each expert's full contiguous bucket to
+    ensure deterministic ordering regardless of atomicAdd scheduling in
+    the CUDA kernel.
+
+    Expert buckets can span multiple blocks, so we find contiguous runs
+    of the same expert_id and sort across the entire run."""
+    n_post = num_tokens_post_pad.item()
+    n_blocks = n_post // block_size
+    if n_blocks == 0:
+        return sorted_ids
+
+    # Walk through blocks, grouping contiguous runs of the same expert
+    b = 0
+    while b < n_blocks:
+        eid = expert_ids[b].item()
+        if eid < 0:
+            b += 1
+            continue
+        # Find the end of this expert's contiguous block run
+        b_end = b + 1
+        while b_end < n_blocks and expert_ids[b_end].item() == eid:
+            b_end += 1
+
+        start = b * block_size
+        end = b_end * block_size
+        bucket = sorted_ids[start:end]
+
+        valid_mask = bucket < num_valid_tokens
+        valid_tokens = bucket[valid_mask]
+        if valid_tokens.numel() > 1:
+            valid_tokens, _ = valid_tokens.sort()
+        n_valid = valid_tokens.numel()
+        sorted_ids[start : start + n_valid] = valid_tokens
+        sorted_ids[start + n_valid : end] = bucket[~valid_mask]
+
+        b = b_end
+
+    return sorted_ids
 
 
 def batched_moe_align_block_size(

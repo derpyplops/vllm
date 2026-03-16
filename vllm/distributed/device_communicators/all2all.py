@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.distributed import get_dp_group, get_ep_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_nvlink_two_sided,
@@ -224,6 +225,66 @@ class AgRsAll2AllManager(All2AllManagerBase):
         topk_weights = gathered_tensors[1]
         topk_ids = gathered_tensors[2]
 
+        # Batch invariant mode: pad gathered tokens to a fixed size so the
+        # MoE kernel always sees the same total batch regardless of per-rank
+        # load distribution.  This eliminates variable-batch non-determinism.
+        if vllm_is_batch_invariant():
+            dp_size = dist_group.world_size
+            padded_total = dp_metadata.max_tokens_across_dp_cpu.item() * dp_size
+            actual_total = hidden_states.shape[0]
+            if actual_total < padded_total:
+                pad_rows = padded_total - actual_total
+                hidden_states = torch.cat(
+                    [
+                        hidden_states,
+                        torch.zeros(
+                            pad_rows,
+                            hidden_states.shape[1],
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        ),
+                    ],
+                    dim=0,
+                )
+                topk_weights = torch.cat(
+                    [
+                        topk_weights,
+                        torch.zeros(
+                            pad_rows,
+                            topk_weights.shape[1],
+                            dtype=topk_weights.dtype,
+                            device=topk_weights.device,
+                        ),
+                    ],
+                    dim=0,
+                )
+                topk_ids = torch.cat(
+                    [
+                        topk_ids,
+                        torch.zeros(
+                            pad_rows,
+                            topk_ids.shape[1],
+                            dtype=topk_ids.dtype,
+                            device=topk_ids.device,
+                        ),
+                    ],
+                    dim=0,
+                )
+                if extra_tensors is not None:
+                    gathered_tensors = list(gathered_tensors)
+                    for idx in range(3, len(gathered_tensors)):
+                        t = gathered_tensors[idx]
+                        pad_shape = list(t.shape)
+                        pad_shape[0] = pad_rows
+                        gathered_tensors[idx] = torch.cat(
+                            [
+                                t,
+                                torch.zeros(pad_shape, dtype=t.dtype, device=t.device),
+                            ],
+                            dim=0,
+                        )
+            dp_metadata.unpadded_total_tokens = actual_total
+
         if extra_tensors is None:
             return hidden_states, topk_weights, topk_ids
 
@@ -239,6 +300,12 @@ class AgRsAll2AllManager(All2AllManagerBase):
         assert dp_metadata is not None
         sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
         assert sizes is not None
+
+        # Batch invariant mode: strip padding rows before reduce_scatterv
+        # so that the reduction operates on the original (unpadded) data.
+        if vllm_is_batch_invariant() and dp_metadata.unpadded_total_tokens is not None:
+            hidden_states = hidden_states[: dp_metadata.unpadded_total_tokens]
+            dp_metadata.unpadded_total_tokens = None
 
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)

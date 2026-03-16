@@ -922,6 +922,135 @@ def test_decode_logprobs_match_prefill_logprobs(
         print(f"{'=' * 80}\n")
 
 
+@skip_unsupported
+@pytest.mark.parametrize(
+    "dp_size",
+    [2, 3, 4],
+    ids=["dp2", "dp3", "dp4"],
+)
+def test_logprobs_batch_invariance_dp_ep(dp_size):
+    """
+    Test batch invariance with data parallel + expert parallel (DP+EP).
+
+    With dp_size > 2, non-determinism can arise from:
+    1. Variable batch sizes after all_gatherv across DP ranks
+    2. Non-deterministic token ordering within expert buckets (atomicAdd)
+    3. Unconstrained NCCL reduce algorithm for reduce_scatterv
+
+    This test verifies that VLLM_BATCH_INVARIANT=1 produces bitwise-identical
+    logprobs regardless of batch composition when using DP+EP.
+
+    dp_size=3 specifically tests odd, non-power-of-2 reduction which is most
+    susceptible to FP accumulation order non-determinism.
+    """
+    seed = int(os.getenv("VLLM_TEST_SEED", "12345"))
+    random.seed(seed)
+
+    # Use a small MoE model for testing
+    model_name = os.getenv("VLLM_TEST_MOE_MODEL", "Qwen/Qwen1.5-MoE-A2.7B-Chat")
+    backend = "FLASH_ATTN"
+
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if num_gpus < dp_size:
+        pytest.skip(f"Test requires {dp_size} GPUs but only {num_gpus} available")
+
+    llm = LLM(
+        model=model_name,
+        data_parallel_size=dp_size,
+        enable_expert_parallel=True,
+        max_num_seqs=32,
+        max_model_len=4096,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.85,
+        enforce_eager=IS_DEVICE_CAPABILITY_BELOW_90,
+        attention_config={"backend": backend},
+    )
+
+    prompts = [_random_prompt(10, 50) for _ in range(16)]
+
+    sp = SamplingParams(
+        temperature=0.6,
+        top_p=1.0,
+        max_tokens=16,
+        seed=1234,
+        logprobs=5,
+    )
+
+    # Run 1: baseline
+    print(f"\n{'=' * 80}")
+    print(f"DP+EP BATCH INVARIANCE TEST (dp_size={dp_size})")
+    print(f"{'=' * 80}")
+    print("\n[Run 1] Generating baseline logprobs...")
+    outs_run1 = llm.generate(prompts, sp, use_tqdm=False)
+
+    run1_logprobs = []
+    run1_tokens = []
+    for o in outs_run1:
+        step_lp, tids = _extract_step_logprobs(o)
+        if step_lp is None:
+            pytest.skip("Logprobs not available on RequestOutput")
+        run1_logprobs.append(step_lp)
+        run1_tokens.append(tids)
+
+    # Run 2: same prompts, different order to change per-rank batch composition
+    reorder = list(range(len(prompts)))
+    random.shuffle(reorder)
+    reordered_prompts = [prompts[i] for i in reorder]
+    inverse = [0] * len(reorder)
+    for new_idx, old_idx in enumerate(reorder):
+        inverse[old_idx] = new_idx
+
+    print("[Run 2] Generating with reordered batch...")
+    outs_run2 = llm.generate(reordered_prompts, sp, use_tqdm=False)
+
+    failed = []
+    for orig_idx in range(len(prompts)):
+        run2_idx = inverse[orig_idx]
+        lp1 = run1_logprobs[orig_idx]
+        lp2_out = outs_run2[run2_idx]
+        lp2, tids2 = _extract_step_logprobs(lp2_out)
+        if lp2 is None:
+            pytest.skip("Logprobs not available")
+
+        if run1_tokens[orig_idx] != tids2:
+            failed.append(
+                {
+                    "prompt_idx": orig_idx,
+                    "reason": "Different tokens sampled",
+                    "run1_tokens": run1_tokens[orig_idx],
+                    "run2_tokens": tids2,
+                }
+            )
+            continue
+
+        if not torch.equal(lp1, lp2):
+            max_diff = torch.abs(lp1 - lp2).max().item()
+            failed.append(
+                {
+                    "prompt_idx": orig_idx,
+                    "reason": f"Logprob mismatch (max_diff={max_diff:.6e})",
+                    "run1_tokens": run1_tokens[orig_idx],
+                    "run2_tokens": tids2,
+                }
+            )
+
+    if failed:
+        print(f"\nDP+EP BATCH INVARIANCE FAILURES: {len(failed)}/{len(prompts)}")
+        for f in failed:
+            print(f"  Prompt {f['prompt_idx']}: {f['reason']}")
+        pytest.fail(
+            f"DP+EP batch invariance violated: {len(failed)}/{len(prompts)} "
+            f"prompts diverged with dp_size={dp_size}"
+        )
+    else:
+        print(
+            f"\n[PASS] All {len(prompts)} prompts bitwise-identical "
+            f"across batch reorderings (dp_size={dp_size})"
+        )
+
+    llm.shutdown()
+
+
 def LLM_with_max_seqs(
     model: str,
     max_num_seqs: int,

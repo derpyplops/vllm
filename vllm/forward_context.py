@@ -95,6 +95,11 @@ class DPMetadata:
     # NOTE: local_sizes should only be set by the chunked_sizes context manager
     local_sizes: list[int] | None = None
 
+    # When batch invariant mode pads the gathered tokens to a fixed size,
+    # this stores the actual (unpadded) total token count so combine() can
+    # strip the padding before reduce_scatterv.
+    unpadded_total_tokens: int | None = None
+
     @staticmethod
     def make(
         parallel_config: ParallelConfig,
